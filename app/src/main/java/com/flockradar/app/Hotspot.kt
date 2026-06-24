@@ -4,11 +4,12 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.net.wifi.WifiManager
 import android.os.Build
+import java.net.NetworkInterface
 
 /**
- * Starts an offline LocalOnlyHotspot (no internet needed) other devices join to
- * reach the dashboard. Returns the auto-generated SSID + passphrase to show the
- * user. Available to apps from API 26 without root.
+ * Hotspot control. Two modes:
+ *  - system LocalOnlyHotspot: no root, but Android forces a RANDOM ssid/password.
+ *  - root soft AP: uses `su` to start an AP with a CUSTOM ssid/password you choose.
  */
 class Hotspot(private val ctx: Context) {
 
@@ -16,7 +17,9 @@ class Hotspot(private val ctx: Context) {
     @Volatile var ssid: String? = null
     @Volatile var passphrase: String? = null
     @Volatile var active = false
+    @Volatile var rootMode = false
 
+    // ---- system LocalOnlyHotspot (no root, random creds) ----
     @SuppressLint("MissingPermission")
     fun start(onReady: () -> Unit, onError: (String) -> Unit) {
         val wifi = ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
@@ -25,28 +28,83 @@ class Hotspot(private val ctx: Context) {
                 override fun onStarted(res: WifiManager.LocalOnlyHotspotReservation) {
                     reservation = res
                     if (Build.VERSION.SDK_INT >= 30) {
-                        val c = res.softApConfiguration
-                        ssid = c.ssid
-                        passphrase = c.passphrase
+                        val c = res.softApConfiguration; ssid = c.ssid; passphrase = c.passphrase
                     } else {
-                        @Suppress("DEPRECATION")
-                        val c = res.wifiConfiguration
-                        @Suppress("DEPRECATION")
-                        run { ssid = c?.SSID; passphrase = c?.preSharedKey }
+                        @Suppress("DEPRECATION") val c = res.wifiConfiguration
+                        @Suppress("DEPRECATION") run { ssid = c?.SSID; passphrase = c?.preSharedKey }
                     }
-                    active = true
-                    onReady()
+                    rootMode = false; active = true; onReady()
                 }
                 override fun onStopped() { active = false }
                 override fun onFailed(reason: Int) { active = false; onError("hotspot failed (code $reason)") }
             }, null)
-        } catch (e: Exception) {
-            onError(e.message ?: "hotspot error")
-        }
+        } catch (e: Exception) { onError(e.message ?: "hotspot error") }
+    }
+
+    // ---- root soft AP with custom SSID + password ----
+    fun startRoot(wantSsid: String, wantPass: String, onReady: () -> Unit, onError: (String) -> Unit) {
+        Thread {
+            // soft AP usually needs the radio, so drop the client wifi first
+            runRoot("svc wifi disable")
+            Thread.sleep(800)
+            val attempts = listOf(
+                "cmd wifi start-softap \"$wantSsid\" wpa2 \"$wantPass\" -b 2",
+                "cmd wifi start-softap \"$wantSsid\" wpa2 \"$wantPass\" 2",
+                "cmd wifi start-softap \"$wantSsid\" wpa2 \"$wantPass\""
+            )
+            var lastOut = ""
+            for (cmd in attempts) {
+                val (code, out) = runRoot(cmd)
+                lastOut = out
+                if (code == -1 && out.contains("not found", true)) {
+                    onError("no root: su not available"); return@Thread
+                }
+                Thread.sleep(1600)
+                val ip = apIp()
+                if (ip != null && ip.endsWith(".1")) {
+                    ssid = wantSsid; passphrase = wantPass; rootMode = true; active = true
+                    onReady(); return@Thread
+                }
+            }
+            runRoot("svc wifi enable")
+            onError("couldn't start: " + lastOut.trim().take(120))
+        }.start()
     }
 
     fun stop() {
-        try { reservation?.close() } catch (_: Exception) {}
-        reservation = null; active = false; ssid = null; passphrase = null
+        if (rootMode) {
+            runRoot("cmd wifi stop-softap"); runRoot("svc wifi enable")
+        } else {
+            try { reservation?.close() } catch (_: Exception) {}
+            reservation = null
+        }
+        active = false; rootMode = false; ssid = null; passphrase = null
+    }
+
+    private fun runRoot(cmd: String): Pair<Int, String> = try {
+        val p = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+        val out = p.inputStream.bufferedReader().readText() + p.errorStream.bufferedReader().readText()
+        p.waitFor()
+        Pair(p.exitValue(), out)
+    } catch (e: Exception) { Pair(-1, e.message ?: "su error") }
+
+    /** Best-effort hotspot interface IPv4 (prefers a gateway-style x.x.x.1). */
+    fun apIp(): String? {
+        try {
+            val ifaces = NetworkInterface.getNetworkInterfaces() ?: return null
+            var fallback: String? = null
+            for (nif in ifaces) {
+                if (!nif.isUp || nif.isLoopback) continue
+                for (addr in nif.inetAddresses) {
+                    val ip = addr.hostAddress ?: continue
+                    if (addr.isLoopbackAddress || ip.contains(":")) continue
+                    if (ip.startsWith("192.168.")) {
+                        if (ip.endsWith(".1")) return ip
+                        fallback = fallback ?: ip
+                    }
+                }
+            }
+            return fallback
+        } catch (_: Exception) { return null }
     }
 }
