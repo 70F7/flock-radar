@@ -1,12 +1,14 @@
 package com.flockradar.app
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.InputType
 import android.view.Gravity
 import android.view.ViewGroup
 import android.webkit.GeolocationPermissions
@@ -14,15 +16,20 @@ import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
+import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var web: WebView
     private lateinit var info: TextView
+    private lateinit var hotspotBtn: Button
+    private val prefs by lazy { getSharedPreferences("fr", Context.MODE_PRIVATE) }
 
     private val permLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()) { startService() }
@@ -46,11 +53,15 @@ class MainActivity : AppCompatActivity() {
             textSize = 12f
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
-        val hotspotBtn = Button(this).apply {
-            text = "Start hotspot"
-            setOnClickListener { toggleHotspot(this) }
+        val settingsBtn = Button(this).apply {
+            text = "Wi-Fi"
+            setOnClickListener { showSettings() }
         }
-        bar.addView(info); bar.addView(hotspotBtn)
+        hotspotBtn = Button(this).apply {
+            text = "Start hotspot"
+            setOnClickListener { toggleHotspot() }
+        }
+        bar.addView(info); bar.addView(settingsBtn); bar.addView(hotspotBtn)
 
         web = WebView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -95,7 +106,6 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
     }
 
-    /** Service binds the port a moment after launch; retry the load until it's up. */
     private fun loadDashboardWhenReady(attempt: Int) {
         web.loadUrl("http://127.0.0.1:${RadarService.PORT}/")
         info.text = "Scanning BLE + WiFi"
@@ -105,24 +115,84 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun toggleHotspot(btn: Button) {
+    // ---- Wi-Fi settings dialog ----
+    private fun showSettings() {
+        val pad = (16 * resources.displayMetrics.density).toInt()
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, 0)
+        }
+        val ssidIn = EditText(this).apply {
+            hint = "Network name (SSID)"
+            setText(prefs.getString("ssid", "FlockRadar"))
+        }
+        val passIn = EditText(this).apply {
+            hint = "Password (min 8 chars)"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+            setText(prefs.getString("pass", ""))
+        }
+        val rootChk = CheckBox(this).apply {
+            text = "Use my name/password (needs root)"
+            isChecked = prefs.getBoolean("useRoot", true)
+        }
+        box.addView(TextView(this).apply {
+            text = "Custom name/password needs root (your NetHunter phone has it). " +
+                   "Unchecked = system hotspot with a random password."
+            textSize = 12f
+        })
+        box.addView(ssidIn); box.addView(passIn); box.addView(rootChk)
+
+        AlertDialog.Builder(this)
+            .setTitle("Hotspot Wi-Fi")
+            .setView(box)
+            .setPositiveButton("Save") { _, _ ->
+                prefs.edit()
+                    .putString("ssid", ssidIn.text.toString().trim())
+                    .putString("pass", passIn.text.toString())
+                    .putBoolean("useRoot", rootChk.isChecked)
+                    .apply()
+                info.text = "Saved. Tap Start hotspot."
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun toggleHotspot() {
         val hs = RadarService.hotspot ?: run { info.text = "service not ready"; return }
         if (hs.active) {
-            hs.stop(); btn.text = "Start hotspot"; info.text = "Scanning BLE + WiFi"
+            hs.stop(); hotspotBtn.text = "Start hotspot"
+            info.text = "Scanning BLE + WiFi"
+            info.setTextColor(Color.parseColor("#9fb0c0"))
             return
         }
-        info.text = "Starting hotspot…"
-        hs.start(
-            onReady = {
-                runOnUiThread {
-                    btn.text = "Stop hotspot"
-                    val ssid = hs.ssid ?: "?"; val pass = hs.passphrase ?: "?"
-                    info.text = "Wi-Fi: $ssid  ·  pass: $pass\nThen open  http://192.168.49.1:${RadarService.PORT}"
-                    info.setTextColor(Color.parseColor("#39d98a"))
-                }
-            },
-            onError = { msg -> runOnUiThread { info.text = msg } }
-        )
+        val useRoot = prefs.getBoolean("useRoot", true)
+        val ssid = prefs.getString("ssid", "FlockRadar") ?: "FlockRadar"
+        val pass = prefs.getString("pass", "") ?: ""
+
+        if (useRoot) {
+            if (pass.length < 8) { info.text = "Set a password (8+ chars) in Wi-Fi settings first"; return }
+            info.text = "Starting hotspot (root)…"
+            hs.startRoot(ssid, pass,
+                onReady = { runOnUiThread { showConnected(hs) } },
+                onError = { msg -> runOnUiThread {
+                    info.text = "Root hotspot failed: $msg — using system hotspot instead"
+                    hs.start({ runOnUiThread { showConnected(hs) } },
+                             { m -> runOnUiThread { info.text = m } })
+                } })
+        } else {
+            info.text = "Starting hotspot…"
+            hs.start(
+                onReady = { runOnUiThread { showConnected(hs) } },
+                onError = { msg -> runOnUiThread { info.text = msg } })
+        }
+    }
+
+    private fun showConnected(hs: Hotspot) {
+        hotspotBtn.text = "Stop hotspot"
+        val ip = hs.apIp() ?: "192.168.49.1"
+        val s = hs.ssid ?: "?"; val p = hs.passphrase ?: "?"
+        info.text = "Wi-Fi: $s  ·  pass: $p\nOpen  http://$ip:${RadarService.PORT}"
+        info.setTextColor(Color.parseColor("#39d98a"))
     }
 
     override fun onBackPressed() {
