@@ -19,7 +19,7 @@ import kotlin.math.tan
 /** Serves the dashboard + APIs to the phone's WebView and any LAN/hotspot client. */
 class WebServer(private val ctx: Context, port: Int = 8080) : NanoHTTPD(port) {
 
-    private val tilesDir = File(ctx.filesDir, "tiles").apply { mkdirs() }
+    private val tilesDir = File(ctx.filesDir, "tiles_sat").apply { mkdirs() }
     private val ua = "flock-radar-app/1.0 (offline ALPR awareness)"
     @Volatile var dlMsg = "idle"
     @Volatile var dlRunning = false
@@ -93,9 +93,14 @@ class WebServer(private val ctx: Context, port: Int = 8080) : NanoHTTPD(port) {
     }
 
     private fun fetchTile(z: Int, x: Int, y: Int): ByteArray? = try {
-        val c = (URL("https://tile.openstreetmap.org/$z/$x/$y.png").openConnection() as HttpURLConnection)
+        // Esri World Imagery (satellite). Note tile order is z/y/x, not z/x/y.
+        val url = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/$z/$y/$x"
+        val c = (URL(url).openConnection() as HttpURLConnection)
         c.setRequestProperty("User-Agent", ua); c.connectTimeout = 8000; c.readTimeout = 12000
-        if (c.responseCode == 200) c.inputStream.readBytes() else null
+        if (c.responseCode == 200) {
+            val bytes = c.inputStream.readBytes()
+            if (bytes.size > 200) bytes else null   // skip tiny error/placeholder bodies
+        } else null
     } catch (_: Exception) { null }
 
     // --- prefetch tiles for a bbox (cameras are bundled, so tiles only) ---
