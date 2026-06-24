@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>flock-radar</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="stylesheet" href="/vendor/leaflet.css">
+<style>
+  :root{--bg:#0a0c0f;--panel:#11151b;--line:#1f2730;--ink:#cfd8e3;--dim:#7c8794;
+    --flock:#ff3b3b;--alpr:#ff9f1c;--rf:#22d3ee;--ok:#39d98a;
+    --mono:ui-monospace,Menlo,Consolas,monospace;}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:var(--mono);font-size:14px;overflow:hidden}
+  #map{position:absolute;inset:0;background:#06080a}
+  .leaflet-container{background:#06080a}
+  .hud{position:absolute;z-index:500}
+  #topbar{top:0;left:0;right:0;display:flex;gap:8px;align-items:center;padding:8px 10px;
+    background:linear-gradient(#0a0c0fdd,#0a0c0f00)}
+  .brand{font-weight:700;letter-spacing:1px;color:#fff}.brand b{color:var(--flock)}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:3px 8px;line-height:1.25}
+  .stat small{display:block;color:var(--dim);font-size:9px;text-transform:uppercase;letter-spacing:.5px}
+  .stat span{font-size:15px;color:#fff}
+  .grow{flex:1}
+  #side{top:52px;right:8px;width:230px;max-width:52vw;display:flex;flex-direction:column;gap:7px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:9px}
+  .card h3{margin:0 0 6px;font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--dim);font-weight:500}
+  button{font-family:var(--mono);font-size:12px;background:#192029;color:var(--ink);
+    border:1px solid var(--line);border-radius:7px;padding:6px 9px;cursor:pointer}
+  button.go{background:#2a1010;border-color:#5a1d1d;color:#ff9a9a}
+  label.tog{display:flex;align-items:center;gap:7px;padding:2px 0;cursor:pointer}
+  label.tog i{width:10px;height:10px;border-radius:50%;display:inline-block}
+  .i-flock{background:var(--flock)}.i-alpr{background:var(--alpr)}.i-rf{background:var(--rf)}
+  #status{color:var(--dim);font-size:10px;margin-top:5px;min-height:12px}
+  #feed{overflow:auto;max-height:30vh}
+  .hit{border-left:3px solid var(--rf);padding:4px 7px;margin-bottom:5px;background:#0e141a;border-radius:0 6px 6px 0}
+  .hit.nofix{border-left-color:var(--alpr)}
+  .hit .b{color:#fff;font-size:12px}.hit .m{color:var(--dim);font-size:10px;word-break:break-all}
+  .empty{color:var(--dim);font-size:11px}
+  #alert{position:absolute;inset:0;z-index:900;display:none;background:rgba(120,0,0,.85);
+    align-items:center;justify-content:center;flex-direction:column;text-align:center}
+  #alert.show{display:flex}
+  #alert .big{font-size:14vw;font-weight:800;color:#fff;letter-spacing:3px}
+  #alert .sub{font-size:5vw;color:#ffd4d4}
+  .pin{border-radius:50%;border:2px solid #000a}
+  .pulse{animation:pulse 1.2s ease-out infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 #22d3ee99}70%{box-shadow:0 0 0 13px #22d3ee00}100%{box-shadow:0 0 0 0 #22d3ee00}}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="hud" id="topbar">
+  <span class="brand">FLOCK&#8209;<b>RADAR</b></span>
+  <div class="stat"><small>Session</small><span id="cSession">0</span></div>
+  <div class="stat"><small>Lifetime</small><span id="cLife">0</span></div>
+  <div class="stat"><small>In view</small><span id="cMap">0</span></div>
+  <span class="grow"></span>
+</div>
+<div class="hud" id="side">
+  <div class="card">
+    <h3>Layers</h3>
+    <label class="tog"><input type="checkbox" id="tFlock" checked><i class="i-flock"></i> Flock</label>
+    <label class="tog"><input type="checkbox" id="tAlpr" checked><i class="i-alpr"></i> Other ALPR</label>
+    <label class="tog"><input type="checkbox" id="tRf" checked><i class="i-rf"></i> Live RF</label>
+    <div style="margin-top:6px"><button id="btnFollow">Follow: off</button>
+      <button id="btnRecenter">Center</button></div>
+  </div>
+  <div class="card">
+    <h3>Offline tiles</h3>
+    <button id="btnDownload" class="go">Cache this view</button>
+    <div id="status">ready</div>
+  </div>
+  <div class="card">
+    <h3>Live RF feed</h3>
+    <div id="feed"><div class="empty">Listening on BLE + WiFi. Cameras not on the map show up here when detected.</div></div>
+  </div>
+</div>
+<div id="alert"><div class="big" id="alertBig">FLOCK</div><div class="sub" id="alertSub">camera ahead</div></div>
+
+<script src="/vendor/leaflet.js"></script>
+<script>
+const WARN_M=488, URGENT_M=152;
+const map=L.map('map',{zoomControl:true,attributionControl:false}).setView([42.0,-85.5],13);
+L.tileLayer('/tiles/{z}/{x}/{y}.png',{maxZoom:19,minZoom:3,
+  errorTileUrl:'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA='}).addTo(map);
+const layers={flock:L.layerGroup().addTo(map),alpr:L.layerGroup().addTo(map),rf:L.layerGroup().addTo(map)};
+let flockPts=[],follow=false,userMarker=null;
+let lifetime=+(localStorage.getItem('fr_life')||0),session=0;
+const alerted=new Set(),seenDet=new Set();
+document.getElementById('cLife').textContent=lifetime;
+function dot(c,r){return L.divIcon({className:'',iconSize:[r*2,r*2],
+  html:`<div class="pin" style="width:${r*2}px;height:${r*2}px;background:${c}"></div>`});}
+
+// cameras for current view
+function loadCameras(){
+  const b=map.getBounds();
+  const bbox=[b.getSouth(),b.getWest(),b.getNorth(),b.getEast()].join(',');
+  fetch('/api/cameras?bbox='+bbox).then(r=>r.json()).then(fc=>{
+    layers.flock.clearLayers();layers.alpr.clearLayers();flockPts=[];
+    let n=0;
+    for(const f of (fc.features||[])){
+      const [lon,lat]=f.geometry.coordinates,flock=f.properties.flock==1;
+      L.marker([lat,lon],{icon:dot(flock?'#ff3b3b':'#ff9f1c',flock?5:4)})
+        .addTo(flock?layers.flock:layers.alpr);
+      if(flock) flockPts.push({lat,lon}); n++;
+    }
+    document.getElementById('cMap').textContent=n;
+  }).catch(()=>{});
+}
+map.on('moveend',loadCameras); loadCameras();
+
+// live detections (poll — works with the app server and the optional feeder)
+const feed=document.getElementById('feed');
+function pollDetections(){
+  fetch('/api/detections').then(r=>r.json()).then(fc=>{
+    for(const f of (fc.features||[])){
+      const p=f.properties,id=(p.mac||'')+(p.ts||'');
+      if(seenDet.has(id))continue; seenDet.add(id); addHit(f);
+    }
+  }).catch(()=>{}).finally(()=>setTimeout(pollDetections,2000));
+}
+function addHit(f){
+  const p=f.properties,located=!!p.located;
+  if(feed.querySelector('.empty'))feed.innerHTML='';
+  const el=document.createElement('div');
+  el.className='hit'+(located?'':' nofix');
+  el.innerHTML=`<div class="b">${p.brand} · ${(p.source||'').toUpperCase()}${p.rssi!=null?' · '+p.rssi+'dBm':''}</div>
+    <div class="m">${p.name?esc(p.name)+' · ':''}${p.mac||''}${located?'':' · no GPS'}</div>`;
+  feed.prepend(el);
+  if(located){const [lon,lat]=f.geometry.coordinates;
+    L.marker([lat,lon],{icon:L.divIcon({className:'',iconSize:[16,16],
+      html:'<div class="pin pulse" style="width:14px;height:14px;background:#22d3ee"></div>'})})
+      .addTo(layers.rf).bindPopup(`${p.brand} (live ${p.source})`);}
+  beep(); say((p.brand||'camera')+' detected');
+}
+pollDetections();
+
+// gps + proximity
+function onPos(pos){const {latitude:lat,longitude:lon}=pos.coords;
+  if(!userMarker){userMarker=L.circleMarker([lat,lon],{radius:6,color:'#39d98a',fillColor:'#39d98a',fillOpacity:1}).addTo(map);}
+  else userMarker.setLatLng([lat,lon]);
+  if(follow)map.panTo([lat,lon],{animate:true});
+  let nearest=Infinity,near=null;
+  for(const c of flockPts){const d=hav(lat,lon,c.lat,c.lon);if(d<nearest){nearest=d;near=c;}}
+  const a=document.getElementById('alert');
+  if(near&&nearest<=URGENT_M){
+    document.getElementById('alertBig').textContent='FLOCK';
+    document.getElementById('alertSub').textContent='camera '+Math.round(nearest*3.28)+' ft';
+    a.classList.add('show');setTimeout(()=>a.classList.remove('show'),5000);
+    const id=near.lat.toFixed(5)+near.lon.toFixed(5);
+    if(!alerted.has(id)){alerted.add(id);session++;lifetime++;localStorage.setItem('fr_life',lifetime);
+      document.getElementById('cSession').textContent=session;
+      document.getElementById('cLife').textContent=lifetime;}
+  } else if(near&&nearest<=WARN_M){beep();}
+}
+if(navigator.geolocation)navigator.geolocation.watchPosition(onPos,()=>{},{enableHighAccuracy:true,maximumAge:1000});
+
+// controls
+document.getElementById('tFlock').onchange=e=>tg('flock',e.target.checked);
+document.getElementById('tAlpr').onchange=e=>tg('alpr',e.target.checked);
+document.getElementById('tRf').onchange=e=>tg('rf',e.target.checked);
+function tg(k,on){on?map.addLayer(layers[k]):map.removeLayer(layers[k]);}
+document.getElementById('btnRecenter').onclick=()=>{if(userMarker)map.setView(userMarker.getLatLng(),15);};
+document.getElementById('btnFollow').onclick=e=>{follow=!follow;e.target.textContent='Follow: '+(follow?'on':'off');};
+document.getElementById('btnDownload').onclick=()=>{
+  const b=map.getBounds(),z=map.getZoom();
+  fetch('/api/download-area',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({south:b.getSouth(),west:b.getWest(),north:b.getNorth(),east:b.getEast(),
+      zoom_min:Math.max(3,z-2),zoom_max:Math.min(17,z+3)})}).then(()=>poll());
+};
+function poll(){fetch('/api/status').then(r=>r.json()).then(s=>{const d=s.download;
+  document.getElementById('status').textContent=d.msg+(d.tiles?(' · '+d.tiles+' tiles'):'');
+  if(d.running)setTimeout(poll,1200);}).catch(()=>{});}
+
+// utils
+function hav(a,b,c,d){const R=6371000,r=x=>x*Math.PI/180,dp=r(c-a),dl=r(d-b);
+  const h=Math.sin(dp/2)**2+Math.cos(r(a))*Math.cos(r(c))*Math.sin(dl/2)**2;return 2*R*Math.asin(Math.sqrt(h));}
+function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+let actx=null;
+function beep(){try{actx=actx||new (window.AudioContext||window.webkitAudioContext)();
+  const o=actx.createOscillator(),g=actx.createGain();o.connect(g);g.connect(actx.destination);
+  o.frequency.value=880;g.gain.value=.07;o.start();o.stop(actx.currentTime+.12);}catch(_){}}
+function say(t){try{if('speechSynthesis'in window){const u=new SpeechSynthesisUtterance(t);u.rate=1.1;speechSynthesis.speak(u);}}catch(_){}}
+if('serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
+</script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+<resources>
+    <style name="Theme.FlockRadar" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:windowBackground">#0a0c0f</item>
+        <item name="android:statusBarColor">#0a0c0f</item>
+    </style>
+</resources>
