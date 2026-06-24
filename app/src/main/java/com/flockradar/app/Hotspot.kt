@@ -7,9 +7,9 @@ import android.os.Build
 import java.net.NetworkInterface
 
 /**
- * Hotspot control. Two modes:
- *  - system LocalOnlyHotspot: no root, but Android forces a RANDOM ssid/password.
- *  - root soft AP: uses `su` to start an AP with a CUSTOM ssid/password you choose.
+ * Hotspot control.
+ *  - system LocalOnlyHotspot: no root, RANDOM ssid/password.
+ *  - root soft AP: uses `su` to start an AP with a CUSTOM ssid/password.
  */
 class Hotspot(private val ctx: Context) {
 
@@ -19,7 +19,6 @@ class Hotspot(private val ctx: Context) {
     @Volatile var active = false
     @Volatile var rootMode = false
 
-    // ---- system LocalOnlyHotspot (no root, random creds) ----
     @SuppressLint("MissingPermission")
     fun start(onReady: () -> Unit, onError: (String) -> Unit) {
         val wifi = ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
@@ -44,30 +43,39 @@ class Hotspot(private val ctx: Context) {
     // ---- root soft AP with custom SSID + password ----
     fun startRoot(wantSsid: String, wantPass: String, onReady: () -> Unit, onError: (String) -> Unit) {
         Thread {
-            // soft AP usually needs the radio, so drop the client wifi first
+            // free the radio: stop any existing AP, turn client wifi off, wait
+            runRoot("cmd wifi stop-softap")
             runRoot("svc wifi disable")
-            Thread.sleep(800)
+            Thread.sleep(2500)
+
+            // Android 14 accepts a few forms; let the system pick the band first.
             val attempts = listOf(
+                "cmd wifi start-softap \"$wantSsid\" wpa2 \"$wantPass\"",
                 "cmd wifi start-softap \"$wantSsid\" wpa2 \"$wantPass\" -b 2",
-                "cmd wifi start-softap \"$wantSsid\" wpa2 \"$wantPass\" 2",
-                "cmd wifi start-softap \"$wantSsid\" wpa2 \"$wantPass\""
+                "cmd wifi start-softap \"$wantSsid\" wpa2 \"$wantPass\" -b 5",
+                "cmd wifi start-softap \"$wantSsid\" wpa3_transition \"$wantPass\" -b 2"
             )
             var lastOut = ""
             for (cmd in attempts) {
                 val (code, out) = runRoot(cmd)
                 lastOut = out
                 if (code == -1 && out.contains("not found", true)) {
-                    onError("no root: su not available"); return@Thread
+                    runRoot("svc wifi enable"); onError("no root: su not available"); return@Thread
                 }
-                Thread.sleep(1600)
-                val ip = apIp()
-                if (ip != null && ip.endsWith(".1")) {
-                    ssid = wantSsid; passphrase = wantPass; rootMode = true; active = true
-                    onReady(); return@Thread
+                // give the AP up to ~8s to come up before judging this attempt
+                repeat(8) {
+                    Thread.sleep(1000)
+                    val ip = apIp()
+                    if (ip != null && ip.endsWith(".1")) {
+                        ssid = wantSsid; passphrase = wantPass; rootMode = true; active = true
+                        onReady(); return@Thread
+                    }
                 }
+                runRoot("cmd wifi stop-softap")
+                Thread.sleep(1200)
             }
             runRoot("svc wifi enable")
-            onError("couldn't start: " + lastOut.trim().take(120))
+            onError(lastOut.trim().take(140).ifBlank { "Soft AP failed (mState=13)" })
         }.start()
     }
 
@@ -88,7 +96,6 @@ class Hotspot(private val ctx: Context) {
         Pair(p.exitValue(), out)
     } catch (e: Exception) { Pair(-1, e.message ?: "su error") }
 
-    /** Best-effort hotspot interface IPv4 (prefers a gateway-style x.x.x.1). */
     fun apIp(): String? {
         try {
             val ifaces = NetworkInterface.getNetworkInterfaces() ?: return null
